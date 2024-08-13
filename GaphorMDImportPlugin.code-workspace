@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../GaphorHelloWorldPlugin/gaphor_plugin_helloworld"
+		},
+		{
+			"path": "../Gaphor"
+		}
+	],
+	"settings": {
+		"iis.activeFolder": "GaphorMDImportPlugin"
+	}
+}

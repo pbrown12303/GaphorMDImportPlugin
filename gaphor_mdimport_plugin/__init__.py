@@ -35,6 +35,6 @@ class MDImportPlugin(Service, ActionProvider):
 
         from gaphor_mdimport_plugin.mdimporter import MDImporter
         mdimporter = MDImporter(self.main_window.window, self.element_factory, self.event_manager)
-        mdimporter.get_mdimportprofile()
+        mdimporter.import_md_model()
         # open_file_dialog(window)
 
