@@ -3,6 +3,7 @@ name = "gaphor_mdimport_plugin"
 version = "0.1.0"
 description = "Plugin for importing MagicDraw modles"
 authors = ["Paul C. Brown <pbrown12303@gmail.com>"]
+readme = "README.md"
 license = "Apache-2.0"
 
 [tool.poetry.dependencies]
