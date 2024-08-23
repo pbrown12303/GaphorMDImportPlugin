@@ -2,13 +2,19 @@ import gi
 
 from gi.repository import Gtk
 from gaphor.core.modeling import ElementFactory
+from gaphor.core.modeling.coremodel import Relationship
+from gaphor.core.modeling.diagram import Diagram
 from gaphor.core.modeling.coremodel import Comment
-from gaphor.UML import Actor, Association, Class, DataType, Enumeration, EnumerationLiteral, Generalization, Include, InstanceSpecification, \
+from gaphor.diagram.drop import drop 
+from gaphor.UML import Actor, Association, Class, DataType, Enumeration, EnumerationLiteral, Generalization, \
+    Include, InstanceSpecification, \
     Interface, InterfaceRealization, Operation, \
     Package, Parameter, Profile, Property, Realization, Stereotype, UseCase 
 from gaphor.transaction import Transaction
 from gaphor.UML.recipes import create_extension
-from Lib.queue import SimpleQueue
+# from gaphor.extensions.ipython import auto_layout
+
+from Lib.queue import Queue
 
 import xml.etree.ElementTree as ET
 
@@ -26,7 +32,9 @@ class MDImporter():
         self.window = window
         self.element_factory = element_factory
         self.event_manager = event_manager
-        self.pending_queue = SimpleQueue()
+        self.pending_queue = Queue()
+        self.diagram_queue = Queue()
+        self.link_queue = Queue()
 
     def import_md_model(self):
         self.open_file_dialog()
@@ -56,7 +64,18 @@ class MDImporter():
                 elif child.tag == "{http://www.omg.org/spec/UML/20131001}Model":
                     self.import_Model(child)
             self.process_pending_queue()
- 
+            self.process_diagram_queue()
+
+    def process_diagram_queue(self):
+        while not self.diagram_queue.empty():
+            entry = self.diagram_queue.get()
+            element = entry.element
+            match element.tag:
+                case "ownedDiagram":
+                    self.deferred_process_Diagram(element)
+                case _:
+                    raise ImportException("Element not processed in process_diagram_queue: " + element.tag)
+
     def process_pending_queue(self):
         while not self.pending_queue.empty():
             entry = self.pending_queue.get()
@@ -102,6 +121,31 @@ class MDImporter():
         stereotype.name = name
         return stereotype
     
+    def deferred_process_Diagram(self, diagram_element:ET.Element):
+        diagram_id = diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        diagram = self.element_factory.lookup(diagram_id)
+        if diagram == None:
+            raise ImportException("Diagram not found in deferred_process_Diagram: " + diagram_id)
+        representation_objects = diagram_element.iter("{http://www.nomagic.com/ns/magicdraw/core/diagram/1.0}DiagramRepresentationObject")
+        for representation_object in representation_objects:
+            diagram_type = representation_object.get("type")
+            diagram.diagramType = diagram_type
+            for used_object_element in representation_object.iter("usedObjects"):
+                used_object_id = used_object_element.get("href")[1:]
+                used_object = self.element_factory.lookup(used_object_id)
+                if isinstance(used_object, Relationship):
+                    entry = PendingEntry(used_object_element, None)
+                    self.link_queue.put(entry)
+                else :
+                    drop(used_object, diagram, x=0, y=0)
+            while not self.link_queue.empty():
+                queue_entry = self.link_queue.get()
+                link_entry = queue_entry.element
+                link_id = link_entry.get("href")[1:]
+                link = self.element_factory.lookup(link_id)
+                drop(link, diagram, x=0, y=0)
+        # auto_layout(diagram)
+
     def deferred_process_Generalization(self, generalization_element:ET.Element):    
         generalization_id = generalization_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         generalization = self.element_factory.lookup(generalization_id)
@@ -217,6 +261,17 @@ class MDImporter():
         datatype.name = name
         return datatype
 
+    def get_diagram(self, name, id, owner:Package, element:ET.Element) -> Diagram:
+        assert id != None
+        diagram = self.element_factory.lookup(id)
+        if diagram == None:
+            diagram = self.element_factory.create_as(Diagram, id=id)
+            diagram.name = name
+            owner.ownedDiagram = diagram
+            pending_diagram_entry = PendingEntry(element, None)
+            self.diagram_queue.put(pending_diagram_entry)
+        return diagram
+
     def get_enumeration(self, name, id, owner:Package) -> Enumeration:
         assert id != None
         enumeration:Enumeration | None = None
@@ -256,7 +311,7 @@ class MDImporter():
         instanceSpecification = self.element_factory.lookup(id)
         if instanceSpecification == None:
             instanceSpecification = self.element_factory.create_as(InstanceSpecification, id)
-            # instanceSpecification.owningPackage = owner # TODO implement this
+            owner.appliedStereotype = instanceSpecification
             instanceSpecification.name = name
         return instanceSpecification
 
@@ -440,10 +495,18 @@ class MDImporter():
         model_id = lib_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         model = self.get_package(model_name, model_id, None)
         for child in lib_element:
-            if child.tag == "ownedComment":
-                self.import_OwnedComment(child, model)
-            elif child.tag == "packagedElement":
-                self.import_PackagedElement(child, model)
+            tag = child.tag
+            match tag:
+                case "ownedComment":
+                    self.import_OwnedComment(child, model)
+                case "packagedElement":
+                    self.import_PackagedElement(child, model)
+                case '{http://www.omg.org/spec/XMI/20131001}Extension':
+                    owned_diagram_elements = child.iter("ownedDiagram")
+                    for owned_diagram_element in owned_diagram_elements:
+                        diagram_id = owned_diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+                        name = owned_diagram_element.get("name")
+                        diagram = self.get_diagram(name, diagram_id, model, owned_diagram_element)
 
     def import_NestedClassifier(self, nested_classifier_element:ET.Element, owner:Class):
         name = nested_classifier_element.get("name")
@@ -684,8 +747,11 @@ class MDImporter():
                         case "packagedElement":
                             self.import_PackagedElement(child, package)
                         case '{http://www.omg.org/spec/XMI/20131001}Extension':
-                            # TODO implement this. One of the extensions is that of a diagram
-                            pass
+                            owned_diagram_elements = child.iter("ownedDiagram")
+                            for owned_diagram_element in owned_diagram_elements:
+                                diagram_id = owned_diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+                                name = owned_diagram_element.get("name")
+                                diagram = self.get_diagram(name, diagram_id, package, owned_diagram_element)
                         case _:
                             raise ImportException("Import of packaged element Package child not processed for tag: " + tag)
             case "uml:Realization":
