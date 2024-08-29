@@ -6,10 +6,11 @@ from gaphor.core.modeling.coremodel import Relationship
 from gaphor.core.modeling.diagram import Diagram
 from gaphor.core.modeling.coremodel import Comment
 from gaphor.diagram.drop import drop 
-from gaphor.UML import Actor, Association, Class, DataType, Enumeration, EnumerationLiteral, Generalization, \
+from gaphor.UML import Abstraction, Actor, Association, Class, Classifier, DataType, Dependency, Enumeration, \
+    EnumerationLiteral, Generalization, \
     Include, InstanceSpecification, \
     Interface, InterfaceRealization, Operation, \
-    Package, Parameter, Profile, Property, Realization, Stereotype, UseCase 
+    Package, Parameter, Profile, Property, Realization, Slot, Stereotype, UseCase 
 from gaphor.transaction import Transaction
 from gaphor.UML.recipes import create_extension
 # from gaphor.extensions.ipython import auto_layout
@@ -35,6 +36,7 @@ class MDImporter():
         self.pending_queue = Queue()
         self.diagram_queue = Queue()
         self.link_queue = Queue()
+        self.diagram_reference_queue = Queue()
 
     def import_md_model(self):
         self.open_file_dialog()
@@ -58,6 +60,8 @@ class MDImporter():
         resultString = result.get_data().decode("utf-8")
         root = ET.fromstring(resultString)
         with Transaction(self.event_manager):
+            # First we import any referenced profiles
+            self.import_referenced_profiles(root)
             for child in root:
                 if child.tag == "{http://www.omg.org/spec/UML/20131001}Profile":
                     self.import_Profile(child)
@@ -65,6 +69,7 @@ class MDImporter():
                     self.import_Model(child)
             self.process_pending_queue()
             self.process_diagram_queue()
+            self.process_diagram_reference_queue()
 
     def process_diagram_queue(self):
         while not self.diagram_queue.empty():
@@ -76,6 +81,19 @@ class MDImporter():
                 case _:
                     raise ImportException("Element not processed in process_diagram_queue: " + element.tag)
 
+    def process_diagram_reference_queue(self):
+        while not self.diagram_reference_queue.empty():
+            entry = self.diagram_reference_queue.get()
+            element = entry.element
+            diagram_element = entry.parent
+            parent_id = diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+            diagram = self.element_factory.lookup(parent_id)
+            match element.tag:
+                case "usedObjects":
+                    used_object_id = element.get("href")[1:]
+                    used_object = self.element_factory.lookup(used_object_id)
+                    drop(used_object, diagram, x=0, y=0)
+
     def process_pending_queue(self):
         while not self.pending_queue.empty():
             entry = self.pending_queue.get()
@@ -83,20 +101,26 @@ class MDImporter():
             parent = entry.parent
             parent_id = None
             gaphor_parent = None
-            gaphor_parent_package = None
             if parent != None:
                 parent_id = parent.get("{http://www.omg.org/spec/XMI/20131001}id")
-                gaphor_parent = self.element_factory.lookup(parent_id)
-                gaphor_parent_package = gaphor_parent.package
+                if parent_id != None:
+                    gaphor_parent = self.element_factory.lookup(parent_id)
             match element.tag:
+                case "client":
+                    self.deferred_process_Dependency(element, gaphor_parent)
+                case "classifier":
+                    self.deferred_process_InstanceSpecification(element, gaphor_parent)
                 case "generalization":
                     self.deferred_process_Generalization(element)
                 case "include":
+                    gaphor_parent_package = None
+                    if gaphor_parent != None:
+                        gaphor_parent_package = gaphor_parent.package
                     self.import_Include(element, gaphor_parent_package, gaphor_parent)
                 case "interfaceRealization":
                     self.import_InterfaceRealization(element, gaphor_parent)
                 case "memberEnd":
-                    self.import_MemberEnd(element, gaphor_parent)
+                    self.deferred_process_MemberEnd(element, gaphor_parent)
                 case "ownedAttribute":
                     type = element.get("{http://www.omg.org/spec/XMI/20131001}type")
                     match type:
@@ -113,14 +137,22 @@ class MDImporter():
                             print ("In process_pending_queue, ownedEnd type not handled for type: " + type)
                 case "ownedParameter":
                     self.deferred_process_Parameter(element)
+                case "supplier":
+                    self.deferred_process_Dependency(element, gaphor_parent)
                 case _:
-                    raise ImportException("Element not processed in process_pending_queue: " + element.tag) 
+                    print ("Element not processed in process_pending_queue: " + element.tag)
+                    # raise ImportException("Element not processed in process_pending_queue: " + element.tag) 
 
-    def create_stereotype(self, name, id) -> Profile:  
-        stereotype = self.element_factory.create_as(Stereotype, id)
-        stereotype.name = name
-        return stereotype
-    
+    def deferred_process_Dependency(self, element:ET.Element, dependency:Dependency):
+        if element.tag == "client":
+            client_id = element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+            client = self.element_factory.lookup(client_id)
+            dependency.client = client
+        elif element.tag == "supplier":
+            supplier_id = element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+            supplier = self.element_factory.lookup(supplier_id)
+            dependency.supplier = supplier
+
     def deferred_process_Diagram(self, diagram_element:ET.Element):
         diagram_id = diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         diagram = self.element_factory.lookup(diagram_id)
@@ -136,6 +168,12 @@ class MDImporter():
                 if isinstance(used_object, Relationship):
                     entry = PendingEntry(used_object_element, None)
                     self.link_queue.put(entry)
+                elif isinstance(used_object, Property): # skip properties
+                    pass
+                elif isinstance(used_object, Diagram):
+                    if used_object_id != diagram_id:
+                        entry = PendingEntry(used_object_element, diagram_element)
+                        self.diagram_reference_queue.put(entry)
                 else :
                     drop(used_object, diagram, x=0, y=0)
             while not self.link_queue.empty():
@@ -153,6 +191,28 @@ class MDImporter():
         abstraction = self.element_factory.lookup(abstraction_id)
         generalization.general = abstraction
 
+    def deferred_process_InstanceSpecification(self, classifier_element:ET.Element, instance_specifiction:InstanceSpecification):
+        raw_id = classifier_element.get("href")
+        split_id = raw_id.split("#")
+        if len(split_id) > 1:
+            id = split_id[1]
+        else:
+            id = raw_id
+        stereotype = self.element_factory.lookup(id)
+        if stereotype == None:
+            print ("Stereotype not found in deferred_process_InstanceSpecification: " + id)
+        else:
+            instance_specifiction.classifier = stereotype
+
+    def deferred_process_MemberEnd(self, member_end_element:ET.Element, owner:Association):
+        idref = member_end_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+        member_end = self.element_factory.lookup(idref)
+        if member_end == None:
+            print ("Member end not found in deferred_process_MemberEnd: " + idref)
+            return
+            # raise ImportException("Member end not found in deferred_process_MemberEnd: " + idref)
+        owner.memberEnd = member_end
+
     def deferred_process_Parameter(self, element:ET.Element):
         parameter_id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
         parameter = self.element_factory.lookup(parameter_id)
@@ -167,8 +227,18 @@ class MDImporter():
         tag = element.tag
         match tag:
             case "ownedEnd":
-                pass
+                type_id = element.get("type")
+                if type_id != None:
+                    type = self.element_factory.lookup(type_id)
+                    property.type = type
             case "ownedAttribute":
+                association_id = element.get("association")
+                if association_id != None:
+                    association = self.element_factory.lookup(association_id)
+                    if association == None:
+                        print ("Association not found in deferred_process_Property: " + association_id)
+                    else:
+                        property.association = association
                 type_id = element.get("type")
                 if type_id == None:
                     for child in element:
@@ -203,6 +273,16 @@ class MDImporter():
                     if value != None:
                         property.upperValue = value
 
+    def get_abstraction(self, id, owner:Package, element:ET.Element) -> Abstraction:
+        assert id != None
+        abstraction = self.element_factory.lookup(id)
+        if abstraction == None:
+            abstraction = self.element_factory.create_as(Abstraction, id)
+            for child in element:
+                pending_queue_entry = PendingEntry(child, element)
+                self.pending_queue.put(pending_queue_entry)
+        return abstraction
+
     def get_actor(self, name, id, owner:Package) -> Actor:
         assert id != None
         actor = self.element_factory.lookup(id)
@@ -212,7 +292,7 @@ class MDImporter():
             actor.package = owner
         return actor
 
-    def get_association(self, id, owner:Package | Class | None) -> Association:
+    def get_association(self, id, owner:Package | Class | None, element: ET.Element) -> Association:
         assert id != None
         association = self.element_factory.lookup(id)
         if association == None:
@@ -221,6 +301,27 @@ class MDImporter():
                 association.package = owner
             elif isinstance(owner, Class):
                 association.nestingClass = owner
+            name = element.get("name")
+            if name != None:
+                association.name = name
+            for child in element:
+                tag = child.tag
+                match tag:
+                    case "memberEnd":
+                        self.pending_queue.put(PendingEntry(child, element))
+                    case "ownedEnd":
+                        self.import_OwnedEnd(child, association)
+                        # self.pending_queue.put(PendingEntry(child, packaged_element))
+                    case "navigableOwnedEnd":
+                        # TODO implement navigableOwnedEnd
+                        print ("Import of packaged element Association child not processed for tag: " + tag)
+                    case "ownedRule":
+                        # TODO implement ownedRule
+                        print ("Import of packaged element Association child not processed for tag: " + tag)
+                    case "ownedComment":
+                        self.import_OwnedComment(child, association)
+                    case _:
+                        raise ImportException("Import of packaged element Association child not processed for tag: " + tag)
         return association
 
     def get_class(self, name, id, owner:Package | Class, xml_element:ET.Element) -> Class:
@@ -248,6 +349,43 @@ class MDImporter():
             visibility = xml_element.get("visibility")
             if visibility != None:
                 uml_class.visibility = visibility
+            for child in xml_element:
+                tag = child.tag
+                match tag:
+                    case "{http://www.omg.org/spec/XMI/20131001}Extension":
+                        # TODO implement Extension
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                    case "generalization":
+                        generalization_id = child.get("{http://www.omg.org/spec/XMI/20131001}id")
+                        generalization = self.get_generalization(generalization_id, uml_class)
+                        pending_queue_entry = PendingEntry(child, xml_element)  
+                        self.pending_queue.put(pending_queue_entry)
+                    case "interfaceRealization":
+                        pending_queue_entry = PendingEntry(child, xml_element)
+                        self.pending_queue.put(pending_queue_entry)
+                    case "nestedClassifier":
+                        self.import_NestedClassifier(child, uml_class)
+                    case "ownedAttribute":
+                        self.import_OwnedAttribute(child, uml_class)
+                    case "ownedComment":
+                        self.import_OwnedComment(child, uml_class)
+                    case "ownedConnector":
+                        # TODO implement ownedConnector
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                    case "ownedOperation":
+                        self.import_OwnedOperation(child, uml_class)
+                    case "ownedRule":
+                        # TODO implement ownedRule
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                    case "ownedTemplateSignature":
+                        # TODO implement ownedTemplateSignature
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                    case "templateBinding":
+                        # TODO implement templateBinding
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                    case _:
+                        print ("Import of packaged element Class child not processed for tag: " + tag)
+                        # raise ImportException("Import of packaged element Class child not processed for tag: " + tag)
         return uml_class
 
     def get_datatype(self, name, id, owner:Package | None) -> DataType:
@@ -261,13 +399,24 @@ class MDImporter():
         datatype.name = name
         return datatype
 
-    def get_diagram(self, name, id, owner:Package, element:ET.Element) -> Diagram:
+    def get_dependency(self, id, element:ET.Element) -> Dependency:
+        assert id != None
+        dependency = self.element_factory.lookup(id)
+        if dependency == None:
+            dependency = self.element_factory.create_as(Dependency, id)
+            for child in element:
+                pending_queue_entry = PendingEntry(child, element)
+                self.pending_queue.put(pending_queue_entry)
+        return dependency
+
+    def get_diagram(self, name, id, owner:Package | None , element:ET.Element) -> Diagram:
         assert id != None
         diagram = self.element_factory.lookup(id)
         if diagram == None:
             diagram = self.element_factory.create_as(Diagram, id=id)
             diagram.name = name
-            owner.ownedDiagram = diagram
+            if owner != None:
+                owner.ownedDiagram = diagram
             pending_diagram_entry = PendingEntry(element, None)
             self.diagram_queue.put(pending_diagram_entry)
         return diagram
@@ -306,13 +455,23 @@ class MDImporter():
             include = self.element_factory.create_as(Include, id)
         return include
 
-    def get_instanceSpecification(self, name, id, owner:Package) -> InstanceSpecification:
+    def get_instanceSpecification(self, id, owner:Package, element:ET.Element) -> InstanceSpecification:
         assert id != None
         instanceSpecification = self.element_factory.lookup(id)
         if instanceSpecification == None:
             instanceSpecification = self.element_factory.create_as(InstanceSpecification, id)
             owner.appliedStereotype = instanceSpecification
-            instanceSpecification.name = name
+            for child in element:
+                tag = child.tag
+                match tag:
+                    case "classifier":
+                        pending_queue_entry = PendingEntry(child, element)
+                        self.pending_queue.put(pending_queue_entry)
+                    case "slot":
+                        slot = self.get_slot(child, instanceSpecification)
+                    case _:
+                        print ("Import of packaged element InstanceSpecification child not processed for tag: " + tag)
+                        # raise ImportException("Import of packaged element InstanceSpecification child not processed for tag: " + tag)
         return instanceSpecification
 
     def get_interface(self, name, id, owner:Package | None) -> Interface:
@@ -326,13 +485,30 @@ class MDImporter():
             interface.name = name
         return interface
 
-    def get_interfaceRealization(self, id, owner:Class) -> InterfaceRealization:
+    def get_interfaceRealization(self, id, owner:Class, element:ET.Element) -> InterfaceRealization:
         assert id != None
         interfaceRealization = self.element_factory.lookup(id)
         if interfaceRealization == None:
-            interfaceRealization = self.element_factory.create_as(InterfaceRealization, id)
+            interface_realization = self.element_factory.create_as(InterfaceRealization, id)
+            interface_realization.implementatingClassifier = owner
             # TODO fix the following after the spelling has been corrected in the gaphor model
-            interfaceRealization.implementatingClassifier = owner
+            interface_realization.implementatingClassifier = owner
+            contract_id = element.get("contract")
+            contract = self.element_factory.lookup(contract_id)
+            interface_realization.contract = contract
+            for child in element:
+                tag = child.tag
+                match tag:
+                    case "client":
+                        client_id = child.get("{http://www.omg.org/spec/XMI/20131001}idref")
+                        client = self.element_factory.lookup(client_id)
+                        interface_realization.client = client
+                    case "supplier":
+                        supplier_id = child.get("{http://www.omg.org/spec/XMI/20131001}idref")
+                        supplier = self.element_factory.lookup(supplier_id)
+                        interface_realization.supplier = supplier
+                    case _:
+                        print ("Import of interface realization child not processed for tag: " + tag)
         return interfaceRealization
 
     # def get_literalString(self, name, id, owner:Package | None) -> LiteralString: 
@@ -359,6 +535,15 @@ class MDImporter():
             isAbstract = element.get("isAbstract")
             if isAbstract == "true":
                 operation.isAbstract = True
+            for child in element:
+                tag = child.tag
+                match tag:
+                    case "ownedParameter":
+                        self.import_OwnedParameter(child, operation)
+                    case "ownedComment":
+                        self.import_OwnedComment(child, operation)
+                    case _:
+                        print ("Import of owned operation child not processed for tag: " + tag)
         return operation
 
     def get_package(self, name, id, owner:Package | None) -> Package:
@@ -398,6 +583,10 @@ class MDImporter():
                 profile = self.element_factory.create_as(Profile, id=id)
                 profile.name = name
         else:
+            profiles = self.element_factory.lselect(Profile)
+            for profile in profiles:
+                if profile.name == name:
+                    return profile  
             profile = self.element_factory.create(Profile)
             profile.name = name
         return profile
@@ -407,26 +596,31 @@ class MDImporter():
         property = self.element_factory.lookup(id)
         if property == None:
             property = self.element_factory.create_as(Property, id)
-            if isinstance(owner, Class):
-                owner.ownedAttribute = property
-            elif isinstance(owner, Association):
-                property.association = owner
             if name != None:
                 property.name = name
             visibility = element.get("visibility")
             if visibility != None:
                 property.visibility = visibility
+            isStatic = element.get("isStatic")
+            if isStatic == "true":
+                property.isStatic = True
+            isReadOnly = element.get("isReadOnly")
+            if isReadOnly == "true":
+                property.isReadOnly = True
+            if isinstance(owner, Class):
+                owner.ownedAttribute = property
             pending_queue_entry = PendingEntry(element, None)
             self.pending_queue.put(pending_queue_entry)
         return property
 
-    def get_realization(self, id, owner:Package) -> Realization:
+    def get_realization(self, id, owner:Package, element:ET.Element) -> Realization:
         assert id != None
         realization = self.element_factory.lookup(id)
         if realization == None:
             realization = self.element_factory.create_as(Realization, id)
-            # TODO fix the following owner reference
-            # realization.owner = owner
+            for child in element:
+                pending_queue_entry = PendingEntry(child, element)
+                self.pending_queue.put(pending_queue_entry)
         return realization
 
     def get_referent_type(self, referentTypeName, profile:Profile) -> Class:
@@ -438,6 +632,34 @@ class MDImporter():
         new_metatype.package = profile
         return new_metatype
 
+    def get_slot(self, element:ET.Element, owner:InstanceSpecification) -> Slot:
+        id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        slot = self.element_factory.lookup(id)
+        if slot == None:
+            slot = self.element_factory.create_as(Slot, id)
+            defining_feature_element = element.find("definingFeature")
+            defining_feature_full_id = defining_feature_element.get("href")
+            defining_feature_id = defining_feature_full_id.split("#")[1]
+            defining_feature = self.element_factory.lookup(defining_feature_id)
+            slot.definingFeature = defining_feature
+            owner.slot = slot
+            value_element = element.find("value")
+            if value_element != None:
+                value = value_element.get("value")
+                if value != None:
+                    slot.value = value
+            # TODO implement value type after gaphor model is updated with LiteralString and other value types
+        return slot
+
+    def get_stereotype(self, name, id, owner:Package) -> Stereotype:  
+        assert id != None
+        stereotype = self.element_factory.lookup(id)
+        if stereotype == None:
+            stereotype = self.element_factory.create_as(Stereotype, id)
+            stereotype.name = name
+            stereotype.package = owner
+        return stereotype
+    
     def get_use_case(self, name, id, owner:Package | None) -> UseCase | None:
         assert id != None
         use_case = self.element_factory.lookup(id)
@@ -447,6 +669,10 @@ class MDImporter():
                 use_case.package = owner
             use_case.name = name
         return use_case
+
+    def import_Abstraction(self, abstraction_element:ET.Element, owner:Package):
+        id = abstraction_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        abstraction = self.get_abstraction(id, owner, abstraction_element)
 
     def import_Include(self, include_element:ET.Element, owner:Package | None, use_case:UseCase):
         included_use_case_id = include_element.get("addition")
@@ -460,35 +686,7 @@ class MDImporter():
 
     def import_InterfaceRealization(self, interface_realization_element:ET.Element, owner:Class):
         id = interface_realization_element.get("{http://www.omg.org/spec/XMI/20131001}id")
-        interface_realization = self.get_interfaceRealization(id, owner)
-        # TODO fix the following after the spelling has been corrected in the gaphor model
-        interface_realization.implementatingClassifier = owner
-        contract_id = interface_realization_element.get("contract")
-        contract = self.element_factory.lookup(contract_id)
-        interface_realization.contract = contract
-        for child in interface_realization_element:
-            tag = child.tag
-            match tag:
-                case "client":
-                    client_id = child.get("{http://www.omg.org/spec/XMI/20131001}idref")
-                    client = self.element_factory.lookup(client_id)
-                    interface_realization.client = client
-                case "supplier":
-                    supplier_id = child.get("{http://www.omg.org/spec/XMI/20131001}idref")
-                    supplier = self.element_factory.lookup(supplier_id)
-                    interface_realization.supplier = supplier
-                case _:
-                    print ("Import of interface realization not processed for tag: " + tag)
-                    # raise ImportException("Import of interface realization not processed for tag: " + tag)
-
-    def import_MemberEnd(self, member_end_element:ET.Element, owner:Association):
-        idref = member_end_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
-        member_end = self.element_factory.lookup(idref)
-        if member_end == None:
-            print ("Member end not found in import_MemberEnd: " + idref)
-            return
-            # raise ImportException("Member end not found in import_MemberEnd: " + idref)
-        owner.memberEnd = member_end
+        interface_realization = self.get_interfaceRealization(id, owner, interface_realization_element)
 
     def import_Model(self, lib_element:ET.Element):
         model_name = lib_element.get("name")
@@ -506,7 +704,7 @@ class MDImporter():
                     for owned_diagram_element in owned_diagram_elements:
                         diagram_id = owned_diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
                         name = owned_diagram_element.get("name")
-                        diagram = self.get_diagram(name, diagram_id, model, owned_diagram_element)
+                        diagram = self.get_diagram(name, diagram_id, None , owned_diagram_element)
 
     def import_NestedClassifier(self, nested_classifier_element:ET.Element, owner:Class):
         name = nested_classifier_element.get("name")
@@ -514,42 +712,9 @@ class MDImporter():
         elementType = nested_classifier_element.get("{http://www.omg.org/spec/XMI/20131001}type")
         match elementType:
             case "uml:Association":
-                association = self.get_association(id, owner)
-                for child in nested_classifier_element:
-                    tag = child.tag
-                    match tag:
-                        case "memberEnd":
-                            self.pending_queue.put(PendingEntry(child, nested_classifier_element))
-                        case "ownedEnd":
-                            self.pending_queue.put(PendingEntry(child, nested_classifier_element))
-                        case "ownedComment":
-                            self.import_OwnedComment(child, association)
-                        case "navigableOwnedEnd":
-                            # TODO implement this
-                            pass
-                        case _:
-                            print ("Import of nested classifier Association child not processed for tag: " + tag)   
-                            # raise ImportException("Import of nested classifier Association child not processed for tag: " + tag)
+                association = self.get_association(id, owner, nested_classifier_element)
             case "uml:Class":
                 uml_class = self.get_class(name, id, owner, nested_classifier_element)
-                for child in nested_classifier_element:
-                    tag = child.tag
-                    match tag:
-                        case "nestedClassifier":
-                            self.import_NestedClassifier(child, uml_class)
-                        case "ownedAttribute":
-                            self.import_OwnedAttribute(child, uml_class)
-                        case "ownedComment":
-                            self.import_OwnedComment(child, uml_class)
-                        case "generalization":
-                            generalization_id = child.get("{http://www.omg.org/spec/XMI/20131001}id")
-                            generalization = self.get_generalization(generalization_id, uml_class)
-                            pending_queue_entry = PendingEntry(child, nested_classifier_element)
-                            self.pending_queue.put(pending_queue_entry)
-                        case _:
-                            print ("Import of nested classifier Class child not processed for tag: " + tag) 
-                            # raise ImportException("Import of nested classifier Class child not processed for tag: " + tag)
-
             case _:
                 print ("Import of nested classifier not processed for element type: " + elementType)
                 # raise ImportException("Import of nested classifier not processed for element type: " + elementType)
@@ -574,7 +739,8 @@ class MDImporter():
         owned_end_type = ownedEnd_element.get("{http://www.omg.org/spec/XMI/20131001}type")
         match owned_end_type:
             case "uml:Property":
-                property = self.get_property(None, owner, id, ownedEnd_element)    
+                property = self.get_property(None, owner, id, ownedEnd_element) 
+                owner.ownedEnd = property   
 
     def import_OwnedLiteral(self, ownedLiteral_element:ET.Element, owner:Enumeration) -> EnumerationLiteral:
         id = ownedLiteral_element.get("{http://www.omg.org/spec/XMI/20131001}id")
@@ -590,16 +756,6 @@ class MDImporter():
         id = ownedOperation_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         name = ownedOperation_element.get("name")
         operation = self.get_operation(name, id, owner, ownedOperation_element)
-        for child in ownedOperation_element:
-            tag = child.tag
-            match tag:
-                case "ownedParameter":
-                    self.import_OwnedParameter(child, operation)
-                case "ownedComment":
-                    self.import_OwnedComment(child, operation)
-                case _:
-                    print ("Import of owned operation not processed for tag: " + tag)
-                    # raise ImportException("Import of owned operation not processed for tag: " + tag)
 
     def import_OwnedParameter(self, ownedParameter_element:ET.Element, owner:Operation):
         id = ownedParameter_element.get("{http://www.omg.org/spec/XMI/20131001}id")
@@ -612,77 +768,20 @@ class MDImporter():
         elementType = packaged_element.get("{http://www.omg.org/spec/XMI/20131001}type")
         match elementType:
             case "uml:Abstraction":
-                # TODO implement this
-                pass
+                self.import_Abstraction(packaged_element, owner)
             case "uml:Actor":
                 self.get_actor(name, id, owner)
             case "uml:Association":
-                association = self.get_association(id, owner)
-                for child in packaged_element:
-                    tag = child.tag
-                    match tag:
-                        case "memberEnd":
-                            self.pending_queue.put(PendingEntry(child, packaged_element))
-                        case "ownedEnd":
-                            self.import_OwnedEnd(child, association)
-                            # self.pending_queue.put(PendingEntry(child, packaged_element))
-                        case "navigableOwnedEnd":
-                            # TODO implement this
-                            pass
-                        case "ownedRule":
-                            # TODO implement this
-                            pass
-                        case "ownedComment":
-                            self.import_OwnedComment(child, association)
-                        case _:
-                            raise ImportException("Import of packaged element Association child not processed for tag: " + tag)
+                association = self.get_association(id, owner, packaged_element)
             case "uml:Class":
                 uml_class = self.get_class(name, id, owner, packaged_element)
-                for child in packaged_element:
-                    tag = child.tag
-                    match tag:
-                        case "{http://www.omg.org/spec/XMI/20131001}Extension":
-                            # TODO implement this
-                            pass
-                        case "generalization":
-                            generalization_id = child.get("{http://www.omg.org/spec/XMI/20131001}id")
-                            generalization = self.get_generalization(generalization_id, uml_class)
-                            pending_queue_entry = PendingEntry(child, packaged_element)  
-                            self.pending_queue.put(pending_queue_entry)
-                        case "interfaceRealization":
-                            pending_queue_entry = PendingEntry(child, packaged_element)
-                            self.pending_queue.put(pending_queue_entry)
-                        case "nestedClassifier":
-                            self.import_NestedClassifier(child, uml_class)
-                        case "ownedAttribute":
-                            self.import_OwnedAttribute(child, uml_class)
-                        case "ownedComment":
-                            self.import_OwnedComment(child, uml_class)
-                        case "ownedConnector":
-                            # TODO implement this
-                            pass
-                        case "ownedOperation":
-                            self.import_OwnedOperation(child, uml_class)
-                        case "ownedRule":
-                            # TODO implement this
-                            pass
-                        case "ownedTemplateSignature":
-                            # TODO implement this
-                            pass
-                        case "templateBinding":
-                            # TODO implement this
-                            pass
-                        case _:
-                            print ("Import of packaged element Class child not processed for tag: " + tag)
-                            # raise ImportException("Import of packaged element Class child not processed for tag: " + tag)
             case "uml:Component":
-                # TODO implement this
-                pass
+                # TODO implement uml:Component
+                print ("Import of packaged element Component not implemented")
             case "uml:DataType":
                 self.get_datatype(name, id, owner)
             case "uml:Dependency":
-                # TODO implement this
-                pass
+                dependency = self.get_dependency(id, packaged_element)
             case "uml:Enumeration":
                 enumeration = self.get_enumeration(name, id, owner)
                 for child in packaged_element:
@@ -690,29 +789,15 @@ class MDImporter():
                     match tag:
                         case "ownedLiteral":
                             self.import_OwnedLiteral(child, enumeration)
-                # TODO implement this
-                pass
             case "uml:Generalization":
                 generalization = self.get_generalization(id, owner)
                 pending_queue_entry = PendingEntry(packaged_element, None)
                 self.pending_queue.put(pending_queue_entry)
             case "uml:InformationFlow":
-                # TODO implement this
-                pass
+                # TODO implement uml:InformationFlow
+                print ("Import of packaged element InformationFlow not implemented")
             case "uml:InstanceSpecification":
-                instanceSpecification = self.get_instanceSpecification(name, id, owner)
-                for child in packaged_element:
-                    tag = child.tag
-                    match tag:
-                        case "classifier":
-                            # TODO implement this
-                            pass
-                        case "slot":
-                            # TODO implement this
-                            pass
-                        case _:
-                            print ("Import of packaged element InstanceSpecification child not processed for tag: " + tag)
-                            # raise ImportException("Import of packaged element InstanceSpecification child not processed for tag: " + tag)
+                instanceSpecification = self.get_instanceSpecification(id, owner, packaged_element)
             case "uml:Interface":
                 interface = self.get_interface(name, id, owner)
                 isAbstract = packaged_element.get("isAbstract")
@@ -734,9 +819,9 @@ class MDImporter():
                             print ("Import of packaged element Interface child not processed for tag: " + tag)
                             # raise ImportException("Import of packaged element Interface child not processed for tag: " + tag)
             case "uml:LiteralString":
-                # TODO implement this
-                pass
+                # TODO implement uml:LiteralString - intentionally ignored for now
                 # self.get_literalString(name, id, owner)
+                pass
             case "uml:Package":  
                 package = self.get_package(name, id, owner)
                 for child in packaged_element:
@@ -755,15 +840,13 @@ class MDImporter():
                         case _:
                             raise ImportException("Import of packaged element Package child not processed for tag: " + tag)
             case "uml:Realization":
-                realization = self.get_realization(id, owner)
-                for child in packaged_element:
-                    pending_queue_entry = PendingEntry(child, packaged_element)
+                realization = self.get_realization(id, owner, packaged_element)
             case "uml:TimeEvent":
-                # TODO implement this
-                pass
+                # TODO implement uml:TimeEvent
+                print ("Import of packaged element TimeEvent not implemented")
             case "uml:Usage":
-                # TODO implement this
-                pass
+                # TODO implement uml:Usage
+                print ("Import of packaged element Usage not implemented")
             case "uml:UseCase":
                 use_case = self.get_use_case(name, id, owner)
                 for child in packaged_element:
@@ -773,16 +856,16 @@ class MDImporter():
                             pending_queue_entry = PendingEntry(child, packaged_element)
                             self.pending_queue.put(pending_queue_entry)
                         case "ownedBehavior":
-                            # TODO implement this
-                            pass
+                            # TODO implement ownedBehavior
+                            print ("Import of packaged element UseCase child not processed for tag: " + tag)
                         case "ownedUseCase":
-                            # TODO implement this
-                            pass
+                            # TODO implement ownedUseCase
+                            print ("Import of packaged element UseCase child not processed for tag: " + tag)
                         case "ownedComment":
                             self.import_OwnedComment(child, use_case)
                         case "{http://www.omg.org/spec/XMI/20131001}Extension":
-                            # TODO implement this
-                            pass
+                            # TODO implement Extension
+                            print ("Import of packaged element UseCase child not processed for tag: " + tag)
                         case _:
                             print ("Import of packaged element UseCase child not processed for tag: " + tag)
                             # raise ImportException("Import of packaged element UseCase child not processed for tag: " + tag)
@@ -798,24 +881,55 @@ class MDImporter():
             if profile_child.get("{http://www.omg.org/spec/XMI/20131001}type") == "uml:Stereotype":
                 self.import_stereotype(profile_child, profile)
 
-    def import_Realization(self, realization_element:ET.Element, owner:Package):
-        id = realization_element.get("{http://www.omg.org/spec/XMI/20131001}id")
-        realization = self.get_realization(id, owner)
-        for child in realization_element:
-            if child.tag == "client":
-                client_id = child.get("idref")
-                client = self.element_factory.lookup(client_id)
-                realization.client = owner
-            elif child.tag == "supplier":
-                supplier_id = child.get("idref")
-                supplier = self.element_factory.lookup(supplier_id)
-                realization.supplier = supplier
+    def import_referenced_profiles(self, lib_element:ET.Element):
+        stereotyp_hrefs = lib_element.iter("stereotypesHREFS")
+        stereotype_dictionary = {}
+        for stereotype_href in stereotyp_hrefs:
+            stereotype_elements = stereotype_href.findall("stereotype")
+            for stereotype_element in stereotype_elements:
+                full_name = stereotype_element.get("name")
+                split_name = full_name.split(":")
+                profile_name = split_name[0]
+                stereotype_name = split_name[1]
+                profile = self.get_profile(profile_name, None)
+                stereotypeHREF = stereotype_element.get("stereotypeHREF")
+                stereotype_id = stereotypeHREF.split("#")[1]
+                stereotype = self.get_stereotype(stereotype_name, stereotype_id, profile)
+                stereotype_dictionary[full_name] = stereotype
+                # Since we don't know the type to which the stereotype may be applied, we will create it as an extension of Element
+                gaphor_metatype = self.get_referent_type("Element", profile) 
+                extension = create_extension(gaphor_metatype, stereotype)
+                extension.package = profile
+            tag_elements = stereotype_href.findall("tag")
+            for tag_element in tag_elements:
+                tag_full_name = tag_element.get("name")
+                split_full_name = tag_full_name.split(":")
+                profile_name = split_full_name[0]
+                stereotype_name = split_full_name[1]
+                tag_name = split_full_name[2]
+                stereotype = stereotype_dictionary[profile_name + ":" + stereotype_name]
+                tag_full_id = tag_element.get("tagURI")
+                tag_id = tag_full_id.split("#")[1]
+                found = False
+                for attribute in stereotype.ownedAttribute:
+                    if attribute.name == tag_name:
+                        found = True
+                if found == False:
+                    new_attribute = self.element_factory.create(Property)
+                    new_attribute.name = tag_name
+                    stereotype.ownedAttribute = new_attribute
+        for child in lib_element:
+            if child.tag == "referencedProfile":
+                profile_id = child.get("{http://www.omg.org/spec/XMI/20131001}idref")
+                profile = self.element_factory.lookup(profile_id)
+                if profile == None:
+                    raise ImportException("Referenced profile not found in import_referenced_profiles: " + profile_id)
+                self.import_Profile(profile)
 
     def import_stereotype(self, stereotype_element:ET.Element, profile:Profile):
         stereotype_name = stereotype_element.get("name")
         stereotype_id = stereotype_element.get("{http://www.omg.org/spec/XMI/20131001}id")
-        stereotype = self.create_stereotype(stereotype_name, stereotype_id)
-        stereotype.package = profile
+        stereotype = self.get_stereotype(stereotype_name, stereotype_id, profile)
         for stereotype_child in stereotype_element.findall("ownedAttribute"):
             if stereotype_child.get("{http://www.omg.org/spec/XMI/20131001}type") == "uml:Property":
                 propertyType = stereotype_child.find("type")
