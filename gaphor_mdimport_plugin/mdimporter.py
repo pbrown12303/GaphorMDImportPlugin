@@ -6,11 +6,13 @@ from gaphor.core.modeling.coremodel import Relationship
 from gaphor.core.modeling.diagram import Diagram
 from gaphor.core.modeling.coremodel import Comment
 from gaphor.diagram.drop import drop 
-from gaphor.UML import Abstraction, Actor, Association, Class, Classifier, DataType, Dependency, Enumeration, \
-    EnumerationLiteral, Generalization, \
-    Include, InstanceSpecification, \
-    Interface, InterfaceRealization, Operation, \
-    Package, Parameter, Profile, Property, Realization, Slot, Stereotype, UseCase 
+from gaphor.UML import Abstraction, AcceptEventAction, Activity, ActivityEdge, ActivityFinalNode, ActivityNode, ActivityParameterNode, \
+    ActivityPartition, Actor, Association, CallAction, CallBehaviorAction, Class, ControlFlow, DataType, DecisionNode, Dependency, Enumeration, \
+    EnumerationLiteral, Event, FlowFinalNode, ForkNode, Generalization, \
+    Include, InitialNode, InputPin, InstanceSpecification, \
+    Interface, InterfaceRealization, JoinNode, MergeNode, \
+    ObjectFlow, ObjectNode, OpaqueAction, Operation, OutputPin, \
+    Package, Parameter, Profile, Property, Realization, SendSignalAction, Slot, Stereotype, UseCase 
 from gaphor.transaction import Transaction
 from gaphor.UML.recipes import create_extension
 # from gaphor.extensions.ipython import auto_layout
@@ -121,6 +123,25 @@ class MDImporter():
                     self.import_InterfaceRealization(element, gaphor_parent)
                 case "memberEnd":
                     self.deferred_process_MemberEnd(element, gaphor_parent)
+                case "node":
+                    node_type = element.get("{http://www.omg.org/spec/XMI/20131001}type")
+                    match node_type:
+                        case "uml:ActivityParameterNode":
+                            activity_parameter_node_id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+                            activity_parameter_node = self.element_factory.lookup(activity_parameter_node_id)   
+                            parameter_id = element.get("parameter")
+                            parameter = self.element_factory.lookup(parameter_id)
+                            activity_parameter_node.parameter = parameter
+                        case "uml:CentralBufferNode":
+                            # TODO update data type to CentralBufferNode after it is added to Gaphor model
+                            central_buffer_node_id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+                            central_buffer_node = self.element_factory.lookup(central_buffer_node_id)
+                            type_id = element.get("type")
+                            type = self.element_factory.lookup(type_id)
+                            central_buffer_node.type = type
+                            # TODO implement inState attribute after it is added to Gaphor model
+                        case _:
+                            print ("Deferred processing of activity node not processed for node type: " + node_type)    
                 case "ownedAttribute":
                     type = element.get("{http://www.omg.org/spec/XMI/20131001}type")
                     match type:
@@ -165,7 +186,9 @@ class MDImporter():
             for used_object_element in representation_object.iter("usedObjects"):
                 used_object_id = used_object_element.get("href")[1:]
                 used_object = self.element_factory.lookup(used_object_id)
-                if isinstance(used_object, Relationship):
+                if used_object == None:
+                    continue
+                if isinstance(used_object, Relationship) or isinstance(used_object, ActivityEdge):
                     entry = PendingEntry(used_object_element, None)
                     self.link_queue.put(entry)
                 elif isinstance(used_object, Property): # skip properties
@@ -283,6 +306,110 @@ class MDImporter():
                 self.pending_queue.put(pending_queue_entry)
         return abstraction
 
+    def get_accept_event_action(self, element:ET.Element, owner:Activity) -> AcceptEventAction:
+        id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        assert id != None
+        accept_event_action = self.element_factory.lookup(id)
+        if accept_event_action == None:
+            accept_event_action = self.element_factory.create_as(AcceptEventAction, id)
+            accept_event_action.activity = owner
+            name = element.get("name")
+            accept_event_action.name = name
+        return accept_event_action
+
+    def get_activity(self, name, id, owner:Package | None, element:ET.Element) -> Activity:
+        assert id != None
+        activity = self.element_factory.lookup(id)
+        if activity == None:
+            activity = self.element_factory.create_as(Activity, id=id)
+            if owner != None:
+                activity.package = owner
+            activity.name = name
+            isReentrant = element.get("isReentrant")
+            if isReentrant == "true":
+                activity.isReentrant = True
+            elif isReentrant == "false":
+                activity.isReentrant = False
+            owned_diagram_elements = element.iter("ownedDiagram")
+            for owned_diagram_element in owned_diagram_elements:
+                diagram_id = owned_diagram_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+                diagram_name = owned_diagram_element.get("name")
+                diagram = self.get_diagram(diagram_name, diagram_id, activity, owned_diagram_element)
+            for node_element in element.findall("node"):
+                self.import_node(node_element, activity)
+            for edge_element in element.findall("edge"):
+                self.import_edge(edge_element, activity)   
+            for group_element in element.findall("group"):
+                self.import_group(group_element, activity)
+        return activity
+
+    def get_activity_final_node(self, node_element:ET.Element, owner:Activity) -> ActivityFinalNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        activity_final_node = self.element_factory.lookup(id)
+        if activity_final_node == None:
+            activity_final_node = self.element_factory.create_as(ActivityFinalNode, id)
+            activity_final_node.activity = owner
+            name = node_element.get("name")
+            activity_final_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                activity_final_node.visibility = visibility
+        return activity_final_node
+
+    def get_activity_node(self, node_element:ET.Element, owner:Activity) -> ActivityNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        activity_node = self.element_factory.lookup(id)
+        if activity_node == None:
+            activity_node = self.element_factory.create_as(ActivityNode, id)
+            activity_node.activity = owner
+            name = node_element.get("name")
+            activity_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                activity_node.visibility = visibility
+        return activity_node
+
+    def get_activity_parameter_node(self, node_element:ET.Element, owner:Activity) -> ActivityParameterNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        activity_parameter_node = self.element_factory.lookup(id)
+        if activity_parameter_node == None:
+            activity_parameter_node = self.element_factory.create_as(ActivityParameterNode, id)
+            activity_parameter_node.activity = owner
+            name = node_element.get("name")
+            activity_parameter_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                activity_parameter_node.visibility = visibility
+            pending_queue_entry = PendingEntry(node_element, None)
+            self.pending_queue.put(pending_queue_entry)
+        return activity_parameter_node
+
+    def get_activity_partition(self, name, id, owner:Activity, element:ET.Element) -> ActivityPartition:
+        assert id != None
+        group = self.element_factory.lookup(id)
+        if group == None:
+            group = self.element_factory.create_as(ActivityPartition, id)
+            group.activity = owner
+            group.name = name
+            for node_element in element.findall("node"):
+                node_id = node_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+                node = self.element_factory.lookup(node_id)
+                node.inPartition = group
+            for edge_element in element.findall("edge"):
+                edge_id = edge_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+                edge = self.element_factory.lookup(edge_id)
+                edge.inGroup = group
+            for child in element:
+                tag = child.tag
+                match tag:
+                    case "node":
+                        pass
+                    case "edge":
+                        pass
+                    case _:
+                        print ("Import of packaged element ActivityPartition child not processed for tag: " + tag)
+        return group
+
     def get_actor(self, name, id, owner:Package) -> Actor:
         assert id != None
         actor = self.element_factory.lookup(id)
@@ -323,6 +450,83 @@ class MDImporter():
                     case _:
                         raise ImportException("Import of packaged element Association child not processed for tag: " + tag)
         return association
+
+    def get_call_behavior_action(self, node_element:ET.Element, owner:Activity) -> CallBehaviorAction:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        call_behavior_action = self.element_factory.lookup(id)
+        if call_behavior_action == None:
+            call_behavior_action = self.element_factory.create_as(CallBehaviorAction, id)
+            call_behavior_action.activity = owner
+            name = node_element.get("name")
+            call_behavior_action.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                call_behavior_action.visibility = visibility
+            for child in node_element:
+                tag = child.tag
+                match tag:
+                    case "argument":
+                        type = child.get("{http://www.omg.org/spec/XMI/20131001}type")
+                        match type:
+                            case "uml:InputPin":
+                                input_pin_id = child.get("{http://www.omg.org/spec/XMI/20131001}id")
+                                input_pin = self.element_factory.create_as(InputPin, input_pin_id)
+                                call_behavior_action.inputValue = input_pin
+                                input_pin_name = child.get("name")
+                                input_pin.name = input_pin_name
+                                visibility = child.get("visibility")
+                                if visibility != None:
+                                    input_pin.visibility = visibility
+                    case "result":
+                        type = child.get("{http://www.omg.org/spec/XMI/20131001}type")
+                        match type:
+                            case "uml:OutputPin":
+                                output_pin_id = child.get("{http://www.omg.org/spec/XMI/20131001}id")
+                                output_pin = self.element_factory.create_as(OutputPin, output_pin_id)
+                                call_behavior_action.outputValue = output_pin
+                                output_pin_name = child.get("name")
+                                output_pin.name = output_pin_name
+                                visibility = child.get("visibility")
+                                if visibility != None:
+                                    output_pin.visibility = visibility
+                    case "inInterruptibleRegion":
+                        # TODO implement when InterruptibleActivityRegion is implemeted in Gaphor model
+                        print ("Import of packaged element CallBehaviorAction child not implemented for tag: " + tag)
+                    case "{http://www.omg.org/spec/XMI/20131001}Extension":
+                        pass
+                    case _:
+                        print ("Import of packaged element CallBehaviorAction child not processed for tag: " + tag)
+                        # raise ImportException("Import of packaged element CallBehaviorAction child not processed for tag: " + tag)
+        return call_behavior_action
+
+    def get_call_operation_action(self, node_element:ET.Element, owner:Activity) -> CallAction:
+        # TODO Change return type to CallOperationAction after it is added to Gaphor model
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        call_operation_action = self.element_factory.lookup(id)
+        if call_operation_action == None:
+            call_operation_action = self.element_factory.create_as(CallAction, id)
+            call_operation_action.activity = owner
+            name = node_element.get("name")
+            call_operation_action.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                call_operation_action.visibility = visibility
+        return call_operation_action
+
+    def get_central_buffer_node(self, node_element:ET.Element, owner:Activity) -> ObjectNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        central_buffer_node = self.element_factory.lookup(id)
+        if central_buffer_node == None:
+            central_buffer_node = self.element_factory.create_as(ObjectNode, id)
+            central_buffer_node.activity = owner
+            name = node_element.get("name")
+            central_buffer_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                central_buffer_node.visibility = visibility
+            pending_queue_entry = PendingEntry(node_element, None)
+            self.pending_queue.put(pending_queue_entry)
+        return central_buffer_node
 
     def get_class(self, name, id, owner:Package | Class, xml_element:ET.Element) -> Class:
         assert id != None
@@ -388,6 +592,41 @@ class MDImporter():
                         # raise ImportException("Import of packaged element Class child not processed for tag: " + tag)
         return uml_class
 
+    def get_conditional_node(self, node_element:ET.Element, owner:Activity) -> OpaqueAction:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        conditional_node = self.element_factory.lookup(id)
+        if conditional_node == None:
+            conditional_node = self.element_factory.create_as(OpaqueAction, id)
+            conditional_node.activity = owner
+            name = node_element.get("name")
+            conditional_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                conditional_node.visibility = visibility
+            print ("Conditional node " + name + " importerd as OpaqueAction. Conditional nodes are presently not implemented in Gaphor")
+        return conditional_node
+
+    def get_control_flow(self, element:ET.Element, owner:Activity) -> ControlFlow:
+        id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        assert id != None
+        control_flow = self.element_factory.lookup(id)
+        if control_flow == None:
+            control_flow = self.element_factory.create_as(ControlFlow, id)
+            control_flow.activity = owner
+            source_id = element.get("source")
+            source = self.element_factory.lookup(source_id)
+            control_flow.source = source
+            source.outgoing = control_flow
+            target_id = element.get("target")   
+            target = self.element_factory.lookup(target_id)
+            control_flow.target = target
+            target.incoming = control_flow
+            visibility = element.get("visibility")
+            if visibility != None:
+                control_flow.visibility = visibility
+            # TODO implement weight after it is added to Gaphor model
+        return control_flow
+
     def get_datatype(self, name, id, owner:Package | None) -> DataType:
         assert id != None
         datatype:DataType | None = None
@@ -398,6 +637,19 @@ class MDImporter():
                 datatype.package = owner
         datatype.name = name
         return datatype
+
+    def get_decision_node(self, node_element:ET.Element, owner:Activity) -> DecisionNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        decision_node = self.element_factory.lookup(id)
+        if decision_node == None:
+            decision_node = self.element_factory.create_as(DecisionNode, id)
+            decision_node.activity = owner
+            name = node_element.get("name")
+            decision_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                decision_node.visibility = visibility
+        return decision_node
 
     def get_dependency(self, id, element:ET.Element) -> Dependency:
         assert id != None
@@ -440,6 +692,32 @@ class MDImporter():
             enumerationLiteral.name = name
         return enumerationLiteral
 
+    def get_flow_final_node(self, node_element:ET.Element, owner:Activity) -> FlowFinalNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        flow_final_node = self.element_factory.lookup(id)
+        if flow_final_node == None:
+            flow_final_node = self.element_factory.create_as(FlowFinalNode, id)
+            flow_final_node.activity = owner
+            name = node_element.get("name")
+            flow_final_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                flow_final_node.visibility = visibility
+        return flow_final_node
+
+    def get_fork_node(self, node_element:ET.Element, owner:Activity) -> ForkNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        fork_node = self.element_factory.lookup(id)
+        if fork_node == None:
+            fork_node = self.element_factory.create_as(ForkNode, id)
+            fork_node.activity = owner
+            name = node_element.get("name")
+            fork_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                fork_node.visibility = visibility
+        return fork_node
+
     def get_generalization(self, id, owner:Class) -> Generalization:
         assert id != None
         generalization = self.element_factory.lookup(id)
@@ -454,6 +732,19 @@ class MDImporter():
         if include == None:
             include = self.element_factory.create_as(Include, id)
         return include
+
+    def get_initial_node(self, node_element:ET.Element, owner:Activity) -> InitialNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        initial_node = self.element_factory.lookup(id)
+        if initial_node == None:
+            initial_node = self.element_factory.create_as(InitialNode, id)
+            initial_node.activity = owner
+            name = node_element.get("name")
+            initial_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                initial_node.visibility = visibility
+        return initial_node
 
     def get_instanceSpecification(self, id, owner:Package, element:ET.Element) -> InstanceSpecification:
         assert id != None
@@ -521,6 +812,115 @@ class MDImporter():
     #                 literalString.package = owner
     #             literalString.name = name
     #     return literalString
+
+    # TODO uncomment get_interruptable_activity_region after it is added to Gaphor model
+    # def get_interruptable_activity_region(self, name, id, owner:Activity, element:ET.Element) -> InterruptibleActivityRegion:
+    #     assert id != None
+    #     group = self.element_factory.lookup(id)
+    #     if group == None:
+    #         group = self.element_factory.create_as(InterruptibleActivityRegion, id)
+    #         group.activity = owner
+    #         group.name = name
+    #         for node_element in element.findall("node"):
+    #             self.import_node(node_element, group)
+    #         for edge_element in element.findall("edge"):
+    #             self.import_edge(edge_element, group)
+    #         for interrupting_edge_element in element.findall("interruptingEdge"):
+    #             interrupting_edge_id = interrupting_edge_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+    #             interrupting_edge = self.element_factory.lookup(interrupting_edge_id)
+    #             group.interruptingEdge = interrupting_edge
+    #     return group
+
+    def get_join_node(self, node_element:ET.Element, owner:Activity) -> JoinNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        join_node = self.element_factory.lookup(id)
+        if join_node == None:
+            join_node = self.element_factory.create_as(JoinNode, id)
+            join_node.activity = owner
+            name = node_element.get("name")
+            join_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                join_node.visibility = visibility
+        return join_node
+
+    def get_loop_node(self, node_element:ET.Element, owner:Activity) -> OpaqueAction:
+        # TODO Change return type to LoopNode after it is added to Gaphor model 
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        loop_node = self.element_factory.lookup(id)
+        if loop_node == None:
+            loop_node = self.element_factory.create_as(OpaqueAction, id)
+            loop_node.activity = owner
+            name = node_element.get("name")
+            loop_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                loop_node.visibility = visibility
+            print ("Loop node " + name + " importerd as OpaqueAction. Loop nodes are presently not implemented in Gaphor")
+            # for child_node_element in node_element.findall("node"):
+            #     self.import_node(child_node_element, loop_node)
+            # for child_edge_element in node_element.findall("edge"):
+            #     self.import_edge(child_edge_element, loop_node)
+            # for body_part_element in node_element.findall("bodyPart"):
+            #     body_part_id = body_part_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+            #     body_part = self.element_factory.lookup(body_part_id)
+            #     loop_node.bodyPart = body_part
+            # for setup_part_element in node_element.findall("setupPart"):
+            #     setup_part_id = setup_part_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+            #     setup_part = self.element_factory.lookup(setup_part_id)
+            #     loop_node.setupPart = setup_part
+            # for test_element in node_element.findall("test"):
+            #     test_id = test_element.get("{http://www.omg.org/spec/XMI/20131001}idref")
+            #     test = self.element_factory.lookup(test_id)
+            #     loop_node.test = test
+        return loop_node
+
+    def get_merge_node(self, node_element:ET.Element, owner:Activity) -> MergeNode:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        merge_node = self.element_factory.lookup(id)
+        if merge_node == None:
+            merge_node = self.element_factory.create_as(MergeNode, id)
+            merge_node.activity = owner
+            name = node_element.get("name")
+            merge_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                merge_node.visibility = visibility
+        return merge_node
+
+    def get_object_flow(self, element:ET.Element, owner:Activity) -> ObjectFlow:
+        id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        assert id != None
+        object_flow = self.element_factory.lookup(id)
+        if object_flow == None:
+            object_flow = self.element_factory.create_as(ObjectFlow, id)
+            object_flow.activity = owner
+            source_id = element.get("source")
+            source = self.element_factory.lookup(source_id)
+            object_flow.source = source
+            source.outgoing = object_flow
+            target_id = element.get("target")   
+            target = self.element_factory.lookup(target_id)
+            object_flow.target = target
+            target.incoming = object_flow
+            visibility = element.get("visibility")
+            if visibility != None:
+                object_flow.visibility = visibility
+            # TODO implement weight after it is added to Gaphor model
+        return object_flow
+
+    def get_opaque_action(self, node_element:ET.Element, owner:Activity) -> OpaqueAction:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        opaque_action = self.element_factory.lookup(id)
+        if opaque_action == None:
+            opaque_action = self.element_factory.create_as(OpaqueAction, id)
+            opaque_action.activity = owner
+            name = node_element.get("name")
+            opaque_action.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                opaque_action.visibility = visibility
+        return opaque_action
 
     def get_operation(self, name, id, owner:Interface, element:ET.Element ) -> Operation:
         assert id != None
@@ -632,6 +1032,35 @@ class MDImporter():
         new_metatype.package = profile
         return new_metatype
 
+    def get_send_signal_action(self, node_element:ET.Element, owner:Activity) -> SendSignalAction:
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        send_signal_action = self.element_factory.lookup(id)
+        if send_signal_action == None:
+            send_signal_action = self.element_factory.create_as(SendSignalAction, id)
+            send_signal_action.activity = owner
+            name = node_element.get("name")
+            send_signal_action.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                send_signal_action.visibility = visibility
+            # TODO implement signal attribute after gaphor model is updated
+        return send_signal_action
+
+    def get_sequence_node(self, node_element:ET.Element, owner:Activity) -> OpaqueAction:
+        # TODO Change return type to SequenceNode after it is added to Gaphor model 
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        sequence_node = self.element_factory.lookup(id)
+        if sequence_node == None:
+            sequence_node = self.element_factory.create_as(OpaqueAction, id)
+            sequence_node.activity = owner
+            name = node_element.get("name")
+            sequence_node.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                sequence_node.visibility = visibility
+            print ("Sequence node " + name + " importerd as OpaqueAction. Sequence nodes are presently not implemented in Gaphor")
+        return sequence_node
+
     def get_slot(self, element:ET.Element, owner:InstanceSpecification) -> Slot:
         id = element.get("{http://www.omg.org/spec/XMI/20131001}id")
         slot = self.element_factory.lookup(id)
@@ -659,7 +1088,24 @@ class MDImporter():
             stereotype.name = name
             stereotype.package = owner
         return stereotype
-    
+
+    def get_time_event(self, node_element:ET.Element, owner:Activity) -> Event:
+        # TODO Change return type to TimeEvent after it is added to Gaphor model
+        id = node_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        time_event = self.element_factory.lookup(id)
+        if time_event == None:
+            time_event = self.element_factory.create_as(Event, id)
+            # TODO Figure out TimeEvent ownership after TimeEvents are implemented in Gaphor
+            # time_event.owningPackage = owner
+            name = node_element.get("name")
+            time_event.name = name
+            visibility = node_element.get("visibility")
+            if visibility != None:
+                time_event.visibility = visibility
+            print ("TimeEvent " + id + " imported as Event. TimeEvents are not presently implemented in Gaphor.")
+            # TODO implement when clause for TimeEvent
+        return time_event
+
     def get_use_case(self, name, id, owner:Package | None) -> UseCase | None:
         assert id != None
         use_case = self.element_factory.lookup(id)
@@ -673,6 +1119,32 @@ class MDImporter():
     def import_Abstraction(self, abstraction_element:ET.Element, owner:Package):
         id = abstraction_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         abstraction = self.get_abstraction(id, owner, abstraction_element)
+
+    def import_edge(self, edge_element:ET.Element, owner:Activity):
+        edge_type = edge_element.get("{http://www.omg.org/spec/XMI/20131001}type")
+        match edge_type:
+            case "uml:ControlFlow":
+                control_flow = self.get_control_flow(edge_element, owner)
+            case "uml:ObjectFlow":
+                object_flow = self.get_object_flow(edge_element, owner)
+            case None:
+                print ("Import of edge not processed, there is no type given.")
+            case _:
+                print ("Import of edge not processed for edge type: " + edge_type)
+
+    def import_group(self, group_element:ET.Element, owner:Package):
+        id = group_element.get("{http://www.omg.org/spec/XMI/20131001}id")
+        name = group_element.get("name")
+        type = group_element.get("{http://www.omg.org/spec/XMI/20131001}type")
+        match type:
+            case "uml:ActivityPartition":
+                self.get_activity_partition(name, id, owner, group_element)
+            case "uml:InterruptibleActivityRegion":
+                # TODO uncomment get_interruptable_activity_region after it is added to Gaphor model
+                # self.get_interruptable_activity_region(name, id, owner, group_element)
+                print ("Import of InterruptibleActivityRegion not implemented. ")
+            case _:
+                print ("Import of group not processed for group type: " + type)
 
     def import_Include(self, include_element:ET.Element, owner:Package | None, use_case:UseCase):
         included_use_case_id = include_element.get("addition")
@@ -719,6 +1191,48 @@ class MDImporter():
                 print ("Import of nested classifier not processed for element type: " + elementType)
                 # raise ImportException("Import of nested classifier not processed for element type: " + elementType)
     
+    def import_node(self, node_element, activity):
+        node_type = node_element.get("{http://www.omg.org/spec/XMI/20131001}type")
+        match node_type:
+            case "uml:AcceptEventAction":
+                accept_event_action = self.get_activity_node(node_element, activity)
+            case "uml:ActivityFinalNode":
+                activity_final_node = self.get_activity_final_node(node_element, activity)
+            case "uml:ActivityParameterNode":
+                activity_parameter_node = self.get_activity_parameter_node(node_element, activity)
+            case "uml:CentralBufferNode":
+                cantral_buffer_node = self.get_central_buffer_node(node_element, activity)
+            case "uml:CallBehaviorAction":
+                call_behavior_action_node = self.get_call_behavior_action(node_element, activity)
+            case "uml:CallOperationAction":
+                call_operation_action_node = self.get_call_operation_action(node_element, activity)
+            case "uml:ConditionalNode":
+                conditional_node = self.get_conditional_node(node_element, activity)
+            case "uml:DecisionNode":
+                decision_node = self.get_decision_node(node_element, activity)
+            case "uml:FlowFinalNode":
+                flow_final_node = self.get_flow_final_node(node_element, activity)
+            case "uml:ForkNode":
+                activity_node = self.get_fork_node(node_element, activity)
+            case "uml:InitialNode":
+                initial_node = self.get_initial_node(node_element, activity)
+            case "uml:JoinNode":
+                join_node = self.get_join_node(node_element, activity)
+            case "uml:LoopNode":
+                loop_node = self.get_loop_node(node_element, activity)
+            case "uml:MergeNode":
+                merge_node = self.get_merge_node(node_element, activity)
+            case "uml:OpaqueAction":
+                opaque_action = self.get_opaque_action(node_element, activity)
+            case "uml:SendSignalAction":
+                send_signal_action = self.get_activity_node(node_element, activity)
+            case "uml:SequenceNode":
+                sequence_node = self.get_sequence_node(node_element, activity)
+            case None:
+                print ("Import of activity node not processed, there is no type given.")
+            case _:
+                print ("Import of activity node not processed for node type: " + node_type)
+
     def import_OwnedAttribute(self, ownedAttribute_element:ET.Element, owner:Class):
         id = ownedAttribute_element.get("{http://www.omg.org/spec/XMI/20131001}id")
         name = ownedAttribute_element.get("name")
@@ -769,6 +1283,8 @@ class MDImporter():
         match elementType:
             case "uml:Abstraction":
                 self.import_Abstraction(packaged_element, owner)
+            case "uml:Activity":
+                self.get_activity(name, id, owner, packaged_element)
             case "uml:Actor":
                 self.get_actor(name, id, owner)
             case "uml:Association":
@@ -842,8 +1358,7 @@ class MDImporter():
             case "uml:Realization":
                 realization = self.get_realization(id, owner, packaged_element)
             case "uml:TimeEvent":
-                # TODO implement uml:TimeEvent
-                print ("Import of packaged element TimeEvent not implemented")
+                time_event = self.get_time_event(packaged_element, owner)
             case "uml:Usage":
                 # TODO implement uml:Usage
                 print ("Import of packaged element Usage not implemented")
