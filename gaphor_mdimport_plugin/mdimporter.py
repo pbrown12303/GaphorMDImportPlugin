@@ -1,4 +1,5 @@
 import gi
+import os
 
 from gi.repository import Gtk
 from gaphor.core.modeling import ElementFactory
@@ -6,6 +7,7 @@ from gaphor.core.modeling.coremodel import Relationship
 from gaphor.core.modeling.diagram import Diagram
 from gaphor.core.modeling.coremodel import Comment
 from gaphor.diagram.drop import drop 
+from gaphor.diagram.tools.txtool import TxData
 from gaphor.UML import Abstraction, AcceptEventAction, Activity, ActivityEdge, ActivityFinalNode, ActivityNode, ActivityParameterNode, \
     ActivityPartition, Actor, Association, CallAction, CallBehaviorAction, Class, ControlFlow, DataType, DecisionNode, Dependency, Enumeration, \
     EnumerationLiteral, Event, FlowFinalNode, ForkNode, Generalization, \
@@ -15,7 +17,7 @@ from gaphor.UML import Abstraction, AcceptEventAction, Activity, ActivityEdge, A
     Package, Parameter, Profile, Property, Realization, SendSignalAction, Slot, Stereotype, UseCase 
 from gaphor.transaction import Transaction
 from gaphor.UML.recipes import create_extension
-# from gaphor.extensions.ipython import auto_layout
+from gaphor.plugins.autolayout import AutoLayout
 
 from Lib.queue import Queue
 
@@ -53,15 +55,23 @@ class MDImporter():
                 return
 
             file = dialog.open_finish(result)
-            self.process_file(file)
+            file_result, textIter = file.load_bytes()
+            file_result_string = file_result.get_data().decode("utf-8")
+
+            # Before we process the file, we need to import the UML Standard Profile
+            uml_profile_file = open("./gaphor_mdimport_plugin/profiles/com.nomagic.magicdraw.uml_model.shared_model")
+            uml_profile_file_contents = uml_profile_file.read()
+            self.process_file_contents(uml_profile_file_contents)
+            uml_profile_file.close()
+
+            self.process_file_contents(file_result_string)
 
         dialog.open(parent=self.window, cancellable=None, callback=response)
 
-    def process_file(self, file):
-        result, textIter = file.load_bytes()
-        resultString = result.get_data().decode("utf-8")
+    def process_file_contents(self, resultString):
         root = ET.fromstring(resultString)
-        with Transaction(self.event_manager):
+        txData = TxData(self.event_manager)
+        with Transaction(self.event_manager) as ctx:
             # First we import any referenced profiles
             self.import_referenced_profiles(root)
             for child in root:
@@ -72,6 +82,7 @@ class MDImporter():
             self.process_pending_queue()
             self.process_diagram_queue()
             self.process_diagram_reference_queue()
+            self.layout_diagrams()
 
     def process_diagram_queue(self):
         while not self.diagram_queue.empty():
@@ -205,7 +216,6 @@ class MDImporter():
                 link_id = link_entry.get("href")[1:]
                 link = self.element_factory.lookup(link_id)
                 drop(link, diagram, x=0, y=0)
-        # auto_layout(diagram)
 
     def deferred_process_Generalization(self, generalization_element:ET.Element):    
         generalization_id = generalization_element.get("{http://www.omg.org/spec/XMI/20131001}id")
@@ -295,6 +305,11 @@ class MDImporter():
                     value = upper_value.get("value")
                     if value != None:
                         property.upperValue = value
+
+    def layout_diagrams(self):
+        for diagram in self.element_factory.select(Diagram):
+            auto_layout = AutoLayout(self.event_manager)
+            auto_layout.layout(diagram)
 
     def get_abstraction(self, id, owner:Package, element:ET.Element) -> Abstraction:
         assert id != None
@@ -477,6 +492,8 @@ class MDImporter():
                                 visibility = child.get("visibility")
                                 if visibility != None:
                                     input_pin.visibility = visibility
+                                call_behavior_action.inputValue = input_pin
+                                input_pin.opaqueAction = call_behavior_action
                     case "result":
                         type = child.get("{http://www.omg.org/spec/XMI/20131001}type")
                         match type:
@@ -489,6 +506,8 @@ class MDImporter():
                                 visibility = child.get("visibility")
                                 if visibility != None:
                                     output_pin.visibility = visibility
+                                call_behavior_action.outputValue = output_pin
+                                output_pin.opaqueAction = call_behavior_action
                     case "inInterruptibleRegion":
                         # TODO implement when InterruptibleActivityRegion is implemeted in Gaphor model
                         print ("Import of packaged element CallBehaviorAction child not implemented for tag: " + tag)
@@ -543,13 +562,13 @@ class MDImporter():
             isAbstract = xml_element.get("isAbstract")
             if isAbstract == "true":
                 uml_class.isAbstract = True
-            isLeaf = xml_element.get("isLeaf")
-            if isLeaf == "true":
-                uml_class.isLeaf = True
-            # TODO implement isFinalSpecialization after gaphor model is updated
-            # isFinalSpecialization = xml_element.get("isFinalSpecialization")
-            # if isFinalSpecialization == "true":
-            #     uml_class.isFinalSpecialization = True
+            # TODO implement isLeaf after it is added to Gaphor model
+            # isLeaf = xml_element.get("isLeaf")
+            # if isLeaf == "true":
+            #     uml_class.isLeaf = True
+            isFinalSpecialization = xml_element.get("isFinalSpecialization")
+            if isFinalSpecialization == "true":
+                uml_class.isFinalSpecialization = True
             visibility = xml_element.get("visibility")
             if visibility != None:
                 uml_class.visibility = visibility
@@ -781,9 +800,7 @@ class MDImporter():
         interfaceRealization = self.element_factory.lookup(id)
         if interfaceRealization == None:
             interface_realization = self.element_factory.create_as(InterfaceRealization, id)
-            interface_realization.implementatingClassifier = owner
-            # TODO fix the following after the spelling has been corrected in the gaphor model
-            interface_realization.implementatingClassifier = owner
+            interface_realization.implementingClassifier = owner
             contract_id = element.get("contract")
             contract = self.element_factory.lookup(contract_id)
             interface_realization.contract = contract
@@ -802,7 +819,8 @@ class MDImporter():
                         print ("Import of interface realization child not processed for tag: " + tag)
         return interfaceRealization
 
-    # def get_literalString(self, name, id, owner:Package | None) -> LiteralString: 
+    # TODO uncomment get_literalString after it is added to Gaphor model
+    # def get_literalString(self, name, id, owner:Package | None, element:ET.Element) -> LiteralString: 
     #     literalString:LiteralString | None = None
     #     if id:
     #         literalString = self.element_factory.lookup(id)
@@ -810,7 +828,9 @@ class MDImporter():
     #             literalString = self.element_factory.create_as(LiteralString, id=id)
     #             if owner != None:
     #                 literalString.package = owner
-    #             literalString.name = name
+    #             value = element.get("value")
+    #             if value != None:
+    #                 literalString.value = value 
     #     return literalString
 
     # TODO uncomment get_interruptable_activity_region after it is added to Gaphor model
@@ -1335,9 +1355,9 @@ class MDImporter():
                             print ("Import of packaged element Interface child not processed for tag: " + tag)
                             # raise ImportException("Import of packaged element Interface child not processed for tag: " + tag)
             case "uml:LiteralString":
-                # TODO implement uml:LiteralString - intentionally ignored for now
-                # self.get_literalString(name, id, owner)
-                pass
+                print ("Import of packaged element LiteralString not implemented")
+                # TODO uncomment get_literalString after LiteralString is added to Gaphor model
+                # literalString = self.get_literalString(name, id, owner, packaged_element)
             case "uml:Package":  
                 package = self.get_package(name, id, owner)
                 for child in packaged_element:

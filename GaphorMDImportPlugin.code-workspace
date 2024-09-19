@@ -4,9 +4,6 @@
 			"path": "."
 		},
 		{
-			"path": "../GaphorHelloWorldPlugin/gaphor_plugin_helloworld"
-		},
-		{
 			"path": "../Gaphor"
 		}
 	],
